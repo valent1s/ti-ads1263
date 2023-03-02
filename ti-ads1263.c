@@ -1,23 +1,14 @@
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/gpio.h>
-#include <linux/spi/spi.h>
-#include <linux/interrupt.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
+#include <linux/iio/iio.h>
+#include <linux/module.h>
+#include <linux/spi/spi.h>
 
-#define SPI_BUS_NUM 0
+#define ADS1263_CLK_HZ				7372800
+#define ADS1263_CLK_NS				(1 / ADS1263_CLK_HZ)
 
-#define DRDY_PIN    17
-#define RESET_PIN   18
-#define CS_PIN      22
-
-#define MAX_SINGLE_CHANNEL_NUM  10
-#define MAX_DIFF_CHANNEL_NUM    4
-
-typedef enum {
-    ADS1263_SINGLE_MODE,
-    ADS1263_DIF_MODE
-} ADS1263_MODE;
+#define ADS1263_WAIT_RESET_CYCLES	4
 
 typedef enum {
     ADS1263_GAIN_1,
@@ -154,49 +145,63 @@ typedef enum {
     CMD_WREG2   = 0x00  // number of registers to write minus 1, 000n nnnn
 } ADS1263_CMD;
 
-unsigned int irq_number;
-static struct spi_device *ads1263_dev;
+struct ads1263 {
+	struct spi_device *spi;
 
-static void ads1263_reset(void)
+	struct gpio_desc  *drdy_pin;
+	struct gpio_desc  *reset_pin;
+
+	unsigned int reset_delay_us;
+};
+
+#define ADC1263_VOLTAGE_CHANNEL(chan1, chan2, si, s)				\
+		{															\
+			.type = IIO_VOLTAGE,									\
+			.indexed = 1,											\
+			.channel = (chan1),										\
+			.channel2 = (chan2),									\
+			.differential = 1,										\
+			.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),			\
+			.scan_index = si,										\
+			.scan_type = {											\
+				.sign = s,											\
+				.realbits = 32,										\
+				.storagebits = 32,									\
+			},														\
+		}
+
+static void ads1263_reset(struct ads1263 *adc)
 {
-    gpio_set_value(RESET_PIN, 1);
-    msleep(300);
-    gpio_set_value(RESET_PIN, 0);
-    msleep(300);
-    gpio_set_value(RESET_PIN, 1);
-    msleep(300);
+    gpiod_set_value(adc->reset_pin, 0);
+    udelay(adc->reset_delay_us);
+    gpiod_set_value(adc->reset_pin, 1);
 }
 
-static void ads1263_write_cmd(uint8_t cmd)
+static void ads1263_write_cmd(struct ads1263 *adc, u8 cmd)
 {
-    gpio_set_value(CS_PIN, 0);
-    spi_write(ads1263_dev, &cmd, 1);
-    gpio_set_value(CS_PIN, 1);
+    spi_write(adc->spi, &cmd, 1);
 }
 
-static void ads1263_write_reg(uint8_t reg, uint8_t data)
+static void ads1263_write_reg(struct ads1263 *adc, u8 reg, u8 data)
 {
-    uint8_t txbuf[3] = { CMD_WREG | reg, 0x00, data };
-    gpio_set_value(CS_PIN, 0);
-    spi_write(ads1263_dev, txbuf, 3);
-    gpio_set_value(CS_PIN, 1);
+    const u8 txbuf[3] = { CMD_WREG | reg, 0x00, data };
+
+    spi_write(adc->spi, txbuf, 3);
 }
 
-static uint8_t ads1263_read_data(uint8_t reg)
+static u8 ads1263_read_reg(struct ads1263 *adc, u8 reg)
 {
-    uint8_t txbuf[2] = { CMD_RREG | reg, 0x00 };
-    uint8_t ret;
+    const u8 txbuf[2] = { CMD_RREG | reg, 0x00 };
+    u8 ret;
 
-    gpio_set_value(CS_PIN, 0);
-    spi_write_then_read(ads1263_dev, txbuf, 2, &ret, 1);
-    gpio_set_value(CS_PIN, 1);
+    spi_write_then_read(adc->spi, txbuf, 2, &ret, 1);
     
     return ret;
 }
 
-static uint8_t ads1263_check_sum(uint32_t val, uint8_t byt)
+static u8 ads1263_check_sum(u32 val, u8 byt)
 {
-    uint8_t sum = 0x9b;
+    u8 sum = 0x9b;
 
     while (val) {
         sum += val & 0xFF;  // only add the lower values
@@ -206,226 +211,163 @@ static uint8_t ads1263_check_sum(uint32_t val, uint8_t byt)
     return sum ^ byt;       // if equal, this will be 0
 }
 
-void ads1263_config_adc1(ADS1263_GAIN gain, ADS1263_DRATE drate, ADS1263_DELAY delay)
+static void ads1263_config_adc1(struct ads1263 *adc, ADS1263_GAIN gain, ADS1263_DRATE drate, ADS1263_DELAY delay)
 {
-    const uint8_t MODE2 = 0x80 | (gain << 4) | drate;   // 0x80:PGA bypassed, 0x00:PGA enabled
-    const uint8_t REFMUX = 0x24;                        // 0x00:+-2.5V as REF, 0x24:VDD,VSS as REF
-    const uint8_t MODE0 = delay;
+    const u8 MODE2 = 0x80 | (gain << 4) | drate;   // 0x80:PGA bypassed, 0x00:PGA enabled
+    const u8 REFMUX = 0x24;                        // 0x00:+-2.5V as REF, 0x24:VDD,VSS as REF
+    const u8 MODE0 = delay;
     
-    ads1263_write_reg(REG_MODE2, MODE2);
-    msleep(1);
-    if (ads1263_read_data(REG_MODE2) != MODE2) {
+    ads1263_write_reg(adc, REG_MODE2, MODE2);
+    if (ads1263_read_reg(adc, REG_MODE2) != MODE2) {
         printk("REG_MODE2 unsuccess \r\n");
         return;
     }
 
-    ads1263_write_reg(REG_REFMUX, REFMUX);
-    msleep(1);
-    if (ads1263_read_data(REG_REFMUX) != REFMUX) {
+    ads1263_write_reg(adc, REG_REFMUX, REFMUX);
+    if (ads1263_read_reg(adc, REG_REFMUX) != REFMUX) {
         printk("REG_REFMUX unsuccess \r\n");
         return;
     }
 
-    ads1263_write_reg(REG_MODE0, MODE0);
-    msleep(1);
-    if (ads1263_read_data(REG_MODE0) != MODE0) {
+    ads1263_write_reg(adc, REG_MODE0, MODE0);
+    if (ads1263_read_reg(adc, REG_MODE0) != MODE0) {
         printk("REG_MODE0 unsuccess \r\n");
         return;
     }
 }
 
-void ads1263_init_adc1(ADS1263_DRATE rate)
+static void ads1263_init_adc1(struct ads1263 *adc, ADS1263_DRATE rate)
 {
-    ads1263_write_cmd(CMD_STOP1);
-    ads1263_config_adc1(ADS1263_GAIN_1, rate, ADS1263_DELAY_35us);
-    ads1263_write_cmd(CMD_START1);
+    ads1263_write_cmd(adc, CMD_STOP1);
+    ads1263_config_adc1(adc, ADS1263_GAIN_1, rate, ADS1263_DELAY_0s);
+    ads1263_write_cmd(adc, CMD_START1);
 }
 
-static void ads1263_set_channel(int channel)
+static void ads1263_set_channel(struct ads1263 *adc, int chan1, int chan2)
 {
-    uint8_t INPMUX = (channel << 4) | 0x0A; //  0x0A:VCOM as Negative Input
+    const u8 INPMUX = (chan1 << 4) | chan2;
     
-    if (channel > MAX_SINGLE_CHANNEL_NUM) {
-        return;
-    }
-
-    ads1263_write_reg(REG_INPMUX, INPMUX);
-    if (ads1263_read_data(REG_INPMUX) != INPMUX) {
-        printk("ADS1263_ADC1_SetChannal unsuccess \r\n");
-        return;
-    }
+    ads1263_write_reg(adc, REG_INPMUX, INPMUX);
+    // if (ads1263_read_reg(adc, REG_INPMUX) != INPMUX) {
+    //     printk("ADS1263_ADC1_SetChannal unsuccess \r\n");
+    //     return;
+    // }
 }
 
-static uint32_t ads1263_read_adc1_data(void)
+static u32 ads1263_read_adc1_data(struct ads1263 *adc)
 {
-    uint8_t status;
-    const uint8_t cmd = CMD_RDATA1;
-    uint8_t buf[5];
-    uint32_t read;
+    u8 buf[6];
+    u32 read;
 
-    gpio_set_value(CS_PIN, 0);
+    spi_read(adc->spi, buf, 6);
 
-    do {
-        spi_write_then_read(ads1263_dev, &cmd, 1, &status, 1);
-    } while(!(status & 0x40));
-    spi_read(ads1263_dev, buf, 5);
+    read  = (u32)buf[1] << 24;
+    read |= (u32)buf[2] << 16;
+    read |= (u32)buf[3] << 8;
+    read |= (u32)buf[4];
 
-    gpio_set_value(CS_PIN, 1);
-
-    read  = (uint32_t)buf[0] << 24;
-    read |= (uint32_t)buf[1] << 16;
-    read |= (uint32_t)buf[2] << 8;
-    read |= (uint32_t)buf[3];
-
-    if (ads1263_check_sum(read, buf[4]) != 0) {
-        printk("ADC1 Data read error! \r\n");
+    if (ads1263_check_sum(read, buf[5]) != 0)
         return 0;
-    }
 
     return read;
 }
 
-uint32_t ads1263_get_channel_value(int channel, ADS1263_MODE mode)
+static int ads1263_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *chan, int *val, int *val2, long mask) {
+	struct ads1263 *adc = iio_priv(indio_dev);
+
+	switch (mask) {
+	case IIO_CHAN_INFO_RAW:
+
+		ads1263_set_channel(adc, chan->channel, chan->channel2);
+
+		while (!gpiod_get_value(adc->drdy_pin));
+		while (gpiod_get_value(adc->drdy_pin));
+
+		*val = ads1263_read_adc1_data(adc);
+		
+		return IIO_VAL_INT;
+	}
+
+	return -EINVAL;
+}
+
+static const struct iio_chan_spec ads1263_channels[] = {
+	ADC1263_VOLTAGE_CHANNEL(0, 0x0A, 0, 's'),
+	ADC1263_VOLTAGE_CHANNEL(1, 0x0A, 1, 's'),
+	ADC1263_VOLTAGE_CHANNEL(2, 0x0A, 2, 's'),
+	ADC1263_VOLTAGE_CHANNEL(3, 0x0A, 3, 's'),
+	ADC1263_VOLTAGE_CHANNEL(4, 0x0A, 4, 's'),
+	ADC1263_VOLTAGE_CHANNEL(5, 0x0A, 5, 's'),
+	ADC1263_VOLTAGE_CHANNEL(6, 0x0A, 6, 's'),
+	ADC1263_VOLTAGE_CHANNEL(7, 0x0A, 7, 's'),
+	ADC1263_VOLTAGE_CHANNEL(8, 0x0A, 8, 's'),
+	ADC1263_VOLTAGE_CHANNEL(9, 0x0A, 9, 's'),
+	ADC1263_VOLTAGE_CHANNEL(0, 1, 10, 's'),
+	ADC1263_VOLTAGE_CHANNEL(2, 3, 11, 's'),
+	ADC1263_VOLTAGE_CHANNEL(4, 5, 12, 's'),
+	ADC1263_VOLTAGE_CHANNEL(6, 7, 13, 's'),
+	ADC1263_VOLTAGE_CHANNEL(8, 9, 14, 's'),
+};
+
+static const struct iio_info ads1263_info = {
+	.read_raw = ads1263_read_raw,
+};
+
+static const struct of_device_id ads1263_of_match[] = {
+	{
+		.compatible	= "ti,ads1263",
+	},
+	{ }
+};
+MODULE_DEVICE_TABLE(of, ads1263_of_match);
+
+static int ads1263_probe(struct spi_device *spi)
 {
-    // switch (mode) {
-    // case ADS1263_SINGLE_MODE:
-    //     if (channel > MAX_SINGLE_CHANNEL_NUM)
-    //         return 0;
-    //     ads1263_set_channel(channel);
-    //     break;
-    // // case ADS1263_DIF_MODE:
-    // //     if (channel > MAX_DIFF_CHANNEL_NUM)
-    // //         return 0;
-    //     // ads1263_set_diff_channel(channel);
-    // }
+	struct iio_dev *indio_dev;
+	struct ads1263 *adc;
+	int ret;
 
-    return ads1263_read_adc1_data();
+	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(struct iio_dev));
+	if (!indio_dev)
+		return -ENOMEM;
+
+	adc = iio_priv(indio_dev);
+	spi_set_drvdata(spi, indio_dev);
+	adc->spi = spi;
+
+	adc->drdy_pin = devm_gpiod_get(&spi->dev, "drdy", GPIOD_IN);
+	if (IS_ERR(adc->drdy_pin))
+		return PTR_ERR(adc->drdy_pin);
+
+	adc->reset_pin = devm_gpiod_get(&spi->dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(adc->reset_pin))
+		return PTR_ERR(adc->reset_pin);
+	
+	indio_dev->dev.parent = &spi->dev;
+	indio_dev->name = "ads1263";
+	indio_dev->info = &ads1263_info;
+	indio_dev->modes = INDIO_DIRECT_MODE;
+	indio_dev->channels = ads1263_channels;
+	indio_dev->num_channels = ARRAY_SIZE(ads1263_channels);
+
+	adc->reset_delay_us = DIV_ROUND_UP(
+		ADS1263_WAIT_RESET_CYCLES * ADS1263_CLK_NS, NSEC_PER_USEC);
+
+    ads1263_reset(adc);
+    ads1263_init_adc1(adc, ADS1263_7200SPS);
+
+	return devm_iio_device_register(&spi->dev, indio_dev);
 }
 
-static irqreturn_t gpio_irq_handler(int irq, void *dev_id) {
-    static uint8_t channel = 0;
-    
-    if (++channel >= 10) channel = 0;
+static struct spi_driver ads1263_driver = {
+	.driver = {
+		.name = "ads1263",
+		.of_match_table = ads1263_of_match
+	},
+	.probe = ads1263_probe,
+};
+module_spi_driver(ads1263_driver);
 
-    uint8_t tx[6] = { CMD_WREG | REG_INPMUX, 0x00, (channel << 4) | 0x0A, 0x00, 0x00, 0x00 };
-    uint8_t rx[6];
-    struct spi_transfer t = {
-        .tx_buf = tx,
-        .rx_buf = &rx,
-        .len = 6
-    };
-
-    struct spi_message m;
-
-    spi_message_init(&m);
-    spi_message_add_tail(&t, &m);
-
-    disable_irq(65);
-    spi_bus_lock(ads1263_dev->controller);
-    gpio_set_value(CS_PIN, 0);
-    spi_sync_locked(ads1263_dev, &m);
-    gpio_set_value(CS_PIN, 1);
-    spi_bus_unlock(ads1263_dev->controller);
-    enable_irq(65);
-
-    return IRQ_HANDLED;
-}
-
-static int __init ModuleInit(void) {
-    struct spi_board_info spi_device_info = {
-        .modalias = "ads1263",
-        .max_speed_hz = 8000000,
-        .bus_num = SPI_BUS_NUM,
-        .chip_select = 1,
-        .mode = SPI_MODE_1,
-    };
-
-    /* Get access to spi bus */
-    struct spi_master *master = spi_busnum_to_master(SPI_BUS_NUM);
-    /* Check if we could get the master */
-    if (!master) {
-        printk("There is no spi bus with Nr. %d\n", SPI_BUS_NUM);
-        return -1;
-    }
-
-    /* Create new SPI device */
-    ads1263_dev = spi_new_device(master, &spi_device_info);
-    if (!ads1263_dev) {
-        spi_unregister_device(ads1263_dev);
-        printk("Could not create device!\n");
-        return -1;
-    }
-
-    ads1263_dev->bits_per_word = 8;
-
-    /* Setup the bus for device's parameters */
-    if (spi_setup(ads1263_dev) != 0) {
-        printk("Could not change bus setup!\n");
-        return -1;
-    }
-
-    if (gpio_request(CS_PIN, "rpi-gpio-4")) {
-        printk("Can not allocate GPIO 4\n");
-        return -1;
-    }
-
-    if (gpio_direction_output(CS_PIN, 1)) {
-        printk("Can not set GPIO 4 to output!\n");
-        return -1;
-    }
-
-    if (gpio_request(RESET_PIN, "rpi-gpio-4")) {
-        printk("Can not allocate GPIO 4\n");
-        return -1;
-    }
-
-    if (gpio_direction_output(RESET_PIN, 1)) {
-        printk("Can not set GPIO 4 to output!\n");
-        return -1;
-    }
-
-    if (gpio_request(DRDY_PIN, "DRDY_PIN")) {
-        printk("Error!\nCan not allocate GPIO 17\n");
-        return -1;
-    }
-
-    if (gpio_direction_input(DRDY_PIN)) {
-        printk("Error!\nCan not set GPIO 17 to input!\n");
-        return -1;
-    }
-
-    ads1263_reset();
-    ads1263_init_adc1(ADS1263_38400SPS);
-    ads1263_set_channel(0);
-
-    /* Setup the interrupt */
-    irq_number = gpio_to_irq(DRDY_PIN);
-    if (request_threaded_irq(irq_number, NULL, gpio_irq_handler, IRQF_TRIGGER_LOW | IRQF_ONESHOT, "ads1263", NULL) != 0) {
-        printk("Error!\nCan not request interrupt nr.: %d\n", irq_number);
-        return -1;
-    }
-    
-    return 0;
-}
-
-/**
- * @brief This function is called, when the module is removed from the kernel
- */
-static void __exit ModuleExit(void) {
-    if (ads1263_dev)
-        spi_unregister_device(ads1263_dev);
-
-    free_irq(irq_number, NULL);
-    gpio_free(DRDY_PIN);
-    gpio_free(CS_PIN);
-    gpio_free(RESET_PIN);
-        
-    printk("Goodbye, Kernel\n");
-}
-
-module_init(ModuleInit);
-module_exit(ModuleExit);
-
+MODULE_AUTHOR("Fedorinov Valentine <fedorinovvalek@gmail.com>");
+MODULE_DESCRIPTION("ADS1263 SPI driver");
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Johannes 4 GNU/Linux");
-MODULE_DESCRIPTION("A simple LKM to read and write some registers of a BMP280 sensor");
