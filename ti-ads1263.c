@@ -347,19 +347,19 @@ static int ads1263_setup(struct iio_dev *indio_dev)
     
     ads1263_write_reg(adc, REG_MODE2, MODE2);
     if (ads1263_read_reg(adc, REG_MODE2) != MODE2) {
-        printk("REG_MODE2 unsuccess\r\n");
+        dev_err(&spi->dev, "REG_MODE2 unsuccess\r\n");
         return 0;
     }
 
     ads1263_write_reg(adc, REG_REFMUX, REFMUX);
     if (ads1263_read_reg(adc, REG_REFMUX) != REFMUX) {
-        printk("REG_REFMUX unsuccess\r\n");
+        dev_err(&spi->dev, "REG_REFMUX unsuccess\r\n");
         return 0;
     }
 
     ads1263_write_reg(adc, REG_MODE1, MODE1);
     if (ads1263_read_reg(adc, REG_MODE1) != MODE1) {
-        printk("REG_MODE1 unsuccess\r\n");
+        dev_err(&spi->dev, "REG_MODE1 unsuccess\r\n");
         return 0;
     }
 
@@ -485,7 +485,7 @@ static int ads1263_probe(struct spi_device *spi)
     
     ret = ads1263_setup(indio_dev);
     if (ret < 0) {
-        dev_err(&spi->dev, "ADS1263 setup failed\r\n");   
+        dev_err(&spi->dev, "setup failed\r\n");
         return ret;
     }
 
