@@ -1,8 +1,13 @@
+#include <asm/unaligned.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/iio/iio.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/trigger.h>
+#include <linux/iio/triggered_buffer.h>
+#include <linux/iio/trigger_consumer.h>
 #include <linux/module.h>
 #include <linux/spi/spi.h>
 
@@ -288,6 +293,7 @@ struct ads1263 {
 				.realbits = 24,								\
 				.storagebits = ADS1263_RESOLUTION,			\
 				.shift = 8,									\
+                .endianness = IIO_BE,                       \
 			},												\
 		}
 
@@ -370,7 +376,7 @@ static int ads1263_setup(struct iio_dev *indio_dev)
     ret = ads1263_write_reg(adc, ADS1263_REG_REFMUX, REFMUX);
     if (ads1263_read_reg(adc, ADS1263_REG_REFMUX) != REFMUX) {
         dev_err(&adc->spi->dev, "REG_REFMUX unsuccess\r\n");
-        return 0;
+        return ret;
     }
 
     ret = ads1263_write_reg(adc, ADS1263_REG_MODE1, MODE1);
@@ -404,12 +410,9 @@ static u32 ads1263_read_adc1_data(struct ads1263 *adc)
     u8 buf[6];
     u32 read;
 
-    spi_read(adc->spi, buf, 6);
+    spi_read(adc->spi, buf, ARRAY_SIZE(buf));
 
-    read  = (u32)buf[1] << 24;
-    read |= (u32)buf[2] << 16;
-    read |= (u32)buf[3] << 8;
-    read |= (u32)buf[4];
+    read = sign_extend32(get_unaligned_be32(&buf[1]), ADS1263_RESOLUTION - 1);
 
     return ads1263_check_sum(read, buf[5]) == 0 ? read : 0;
 }
@@ -418,9 +421,14 @@ static int ads1263_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec cons
 	struct ads1263 *adc = iio_priv(indio_dev);
 	int ret;
 
-    const u8 MODE2 = (adc->channel_config[chan->channel].pga_gain << 4) | ADS1263_400SPS;
+    const u8 MODE2 = FIELD_PREP(ADS1263_MODE2_GAIN, adc->channel_config[chan->channel].pga_gain) |
+        FIELD_PREP(ADS1263_MODE2_DR, ADS1263_400SPS);
+
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
+        ret = iio_device_claim_direct_mode(indio_dev);
+		if (ret)
+			return ret;
 
         ads1263_write_reg(adc, ADS1263_REG_MODE2, MODE2);
 		ads1263_set_channel(adc, chan->channel, chan->channel2);
@@ -431,6 +439,8 @@ static int ads1263_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec cons
 			return -ETIMEDOUT;
 
 		*val = ads1263_read_adc1_data(adc);
+
+        iio_device_release_direct_mode(indio_dev);
 		
 		return IIO_VAL_INT;
     case IIO_CHAN_INFO_HARDWAREGAIN:
@@ -478,6 +488,20 @@ static const struct iio_info ads1263_info = {
     .write_raw = ads1263_write_raw,
 };
 
+static irqreturn_t ads1263_trigger_handler(int irq, void *private)
+{
+    struct iio_poll_func *pf = private;
+	struct iio_dev *indio_dev = pf->indio_dev;
+    const u32 i[indio_dev->num_channels];
+
+    iio_push_to_buffers(indio_dev, i);
+
+// out:
+	// iio_trigger_notify_done(indio_dev->trig);
+
+	return IRQ_HANDLED;
+}
+
 static irqreturn_t ads1263_drdy_handler(int irq, void *private)
 {
 	struct iio_dev *indio_dev = private;
@@ -512,10 +536,23 @@ static int ads1263_probe(struct spi_device *spi)
 	indio_dev->channels = ads1263_channels;
 	indio_dev->num_channels = ARRAY_SIZE(ads1263_channels);
 
-	ret = devm_request_irq(&spi->dev, spi->irq, ads1263_drdy_handler,
-			       IRQF_TRIGGER_FALLING, indio_dev->name, indio_dev);
-	if (ret)
+    if (spi->irq) {
+		ret = devm_request_irq(&spi->dev, spi->irq, ads1263_drdy_handler,
+                IRQF_TRIGGER_FALLING, indio_dev->name, indio_dev);
+		if (ret)
+			return dev_err_probe(&spi->dev, ret,
+					     "request irq failed\n");
+	} else {
+		dev_err(&spi->dev, "data ready IRQ missing\n");
+		return -ENODEV;
+	}
+
+    ret = devm_iio_triggered_buffer_setup(&spi->dev, indio_dev,
+		NULL, &ads1263_trigger_handler, NULL);
+	if (ret) {
+		dev_err(&spi->dev, "failed to setup IIO buffer\n");
 		return ret;
+	}
 
 	spi->cs_setup.value = ADS1263_WAIT_CSSC_NS;
 	spi->cs_setup.unit = SPI_DELAY_UNIT_NSECS;
