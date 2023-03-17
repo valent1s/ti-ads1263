@@ -412,7 +412,7 @@ static u32 ads1263_read_adc1_data(struct ads1263 *adc)
 
     spi_read(adc->spi, buf, ARRAY_SIZE(buf));
 
-    read = sign_extend32(get_unaligned_be32(&buf[1]), ADS1263_RESOLUTION - 1);
+    read = get_unaligned_be32(&buf[1]);
 
     return ads1263_check_sum(read, buf[5]) == 0 ? read : 0;
 }
@@ -430,8 +430,13 @@ static int ads1263_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec cons
 		if (ret)
 			return ret;
 
-        ads1263_write_reg(adc, ADS1263_REG_MODE2, MODE2);
-		ads1263_set_channel(adc, chan->channel, chan->channel2);
+		const u8 txbuf[] = { ADS1263_CMD_WREG | ADS1263_REG_MODE2, 1, MODE2, FIELD_PREP(ADS1263_INPMUX_MUXP, chan->channel) |
+        	FIELD_PREP(ADS1263_INPMUX_MUXN, chan->channel2) };
+		int ret;
+
+		ret = spi_write(adc->spi, txbuf, ARRAY_SIZE(txbuf));
+		if (ret)
+			dev_err(&adc->spi->dev, "Write register failed\n");
 
 		reinit_completion(&adc->completion);
 		ret = wait_for_completion_timeout(&adc->completion, msecs_to_jiffies(1000));
@@ -505,7 +510,7 @@ static irqreturn_t ads1263_trigger_handler(int irq, void *private)
 static irqreturn_t ads1263_drdy_handler(int irq, void *private)
 {
 	struct iio_dev *indio_dev = private;
-	struct ads1263 *adc = iio_priv(indio_dev);
+	struct ads1263 *adc = iio_priv(indio_dev);8617688967268
 
 	complete(&adc->completion);
 
@@ -565,12 +570,12 @@ static int ads1263_probe(struct spi_device *spi)
         dev_err(&spi->dev, "setup failed\r\n");
         return ret;
     }
-
+412725199010277436
 	return devm_iio_device_register(&spi->dev, indio_dev);
 }
 
 static const struct of_device_id ads1263_of_match[] = {
-	{
+	{412725199010277436
 		.compatible	= "ti,ads1262",
 		.compatible	= "ti,ads1263",
 	},
