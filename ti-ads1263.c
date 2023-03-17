@@ -263,6 +263,7 @@
 #define ADS1263_WAIT_RESET_CYCLES	4
 #define ADS1263_WAIT_CSSC_NS		50
 #define ADS1263_WAIT_SCCS_NS		40
+#define ADS1263_MAX_SETTLING_TIME_MS	1000
 
 struct ads1263_channel_config {
 	unsigned int pga_gain;
@@ -270,12 +271,15 @@ struct ads1263_channel_config {
 
 struct ads1263 {
 	struct spi_device *spi;
+	struct iio_trigger	*trig;
 
 	struct ads1263_channel_config *channel_config;
 
 	struct completion completion;
 
 	struct gpio_desc  *reset_pin;
+	
+	u8 rx_buf[1 + 4 + 1];
 };
 
 #define ADC1263_VOLTAGE_CHANNEL(chan1, chan2, si)			\
@@ -354,6 +358,25 @@ static size_t ads1263_check_sum(u32 val, u8 byt)
     return sum ^ byt;       // if equal, this will be 0
 }
 
+static int ads1263_read_adc1_data(struct ads1263 *adc)
+{
+    u8 buf[6];
+    u32 read;
+
+    spi_read(adc->spi, buf, ARRAY_SIZE(buf));
+
+    read = get_unaligned_be32(&buf[1]);
+
+    return ads1263_check_sum(read, buf[5]) == 0 ? read : 0;
+}
+
+static inline void ads1263_set_channel(struct ads1263 *adc, int chan1, int chan2)
+{   
+    ads1263_write_reg(adc, ADS1263_REG_INPMUX,
+        FIELD_PREP(ADS1263_INPMUX_MUXP, chan1) |
+        FIELD_PREP(ADS1263_INPMUX_MUXN, chan2));
+}
+
 static int ads1263_setup(struct iio_dev *indio_dev)
 {
     struct ads1263 *adc = iio_priv(indio_dev);
@@ -385,10 +408,6 @@ static int ads1263_setup(struct iio_dev *indio_dev)
         return ret;
     }
 
-    ret = ads1263_write_cmd(adc, ADS1263_CMD_START1);
-	if (ret)
-		return ret;
-
     channel_config = devm_kcalloc(&adc->spi->dev, indio_dev->num_channels, sizeof(*channel_config), GFP_KERNEL);
 	if (!channel_config)
         return -ENOMEM;
@@ -398,31 +417,12 @@ static int ads1263_setup(struct iio_dev *indio_dev)
     return 0;
 }
 
-static inline void ads1263_set_channel(struct ads1263 *adc, int chan1, int chan2)
-{   
-    ads1263_write_reg(adc, ADS1263_REG_INPMUX,
-        FIELD_PREP(ADS1263_INPMUX_MUXP, chan1) |
-        FIELD_PREP(ADS1263_INPMUX_MUXN, chan2));
-}
-
-static u32 ads1263_read_adc1_data(struct ads1263 *adc)
-{
-    u8 buf[6];
-    u32 read;
-
-    spi_read(adc->spi, buf, ARRAY_SIZE(buf));
-
-    read = get_unaligned_be32(&buf[1]);
-
-    return ads1263_check_sum(read, buf[5]) == 0 ? read : 0;
-}
-
 static int ads1263_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *chan, int *val, int *val2, long mask) {
 	struct ads1263 *adc = iio_priv(indio_dev);
 	int ret;
 
     const u8 MODE2 = FIELD_PREP(ADS1263_MODE2_GAIN, adc->channel_config[chan->channel].pga_gain) |
-        FIELD_PREP(ADS1263_MODE2_DR, ADS1263_400SPS);
+        FIELD_PREP(ADS1263_MODE2_DR, ADS1263_100SPS);
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
@@ -439,7 +439,8 @@ static int ads1263_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec cons
 			dev_err(&adc->spi->dev, "Write register failed\n");
 
 		reinit_completion(&adc->completion);
-		ret = wait_for_completion_timeout(&adc->completion, msecs_to_jiffies(1000));
+
+		ret = wait_for_completion_timeout(&adc->completion, msecs_to_jiffies(ADS1263_MAX_SETTLING_TIME_MS));
 		if (!ret)
 			return -ETIMEDOUT;
 
@@ -468,14 +469,6 @@ static int ads1263_write_raw(struct iio_dev *indio_dev, struct iio_chan_spec con
 	return -EINVAL;
 }
 
-static const struct iio_chan_spec ads1263_channels[] = {
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN0, ADS1263_AINCOM, 0),
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN1, ADS1263_AINCOM, 1),
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN2, ADS1263_AINCOM, 2),
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN3, ADS1263_AINCOM, 3),
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN4, ADS1263_AIN5,   4)
-};
-
 // static IIO_CONST_ATTR(hardwaregain_available,
 // 	"0 1 2 3 4 5 6 7");
 
@@ -493,29 +486,116 @@ static const struct iio_info ads1263_info = {
     .write_raw = ads1263_write_raw,
 };
 
+static int ads1263_set_trigger_state(struct iio_trigger *trig, bool state)
+{
+	struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
+	struct ads1263 *adc = iio_priv(indio_dev);
+
+	return ads1263_write_cmd(adc, state ? ADS1263_CMD_START1 : ADS1263_CMD_STOP1);
+}
+
+static const struct iio_trigger_ops ads1263_trigger_ops = {
+	.set_trigger_state = &ads1263_set_trigger_state,
+};
+
 static irqreturn_t ads1263_trigger_handler(int irq, void *private)
 {
     struct iio_poll_func *pf = private;
 	struct iio_dev *indio_dev = pf->indio_dev;
-    const u32 i[indio_dev->num_channels];
+	struct ads1263 *adc = iio_priv(indio_dev);
+	int ret;
+	int scan_index;
+    u32 i[indio_dev->num_channels];
+
+	// if (!iio_trigger_using_own(indio_dev))
+	// 	ads1263_write_cmd(adc, ADS1263_CMD_START1);
+
+	scan_index = find_first_bit(indio_dev->active_scan_mask, indio_dev->masklength);
+	const struct iio_chan_spec *scan_chan = &indio_dev->channels[scan_index];
+
+	const u8 MODE2 = FIELD_PREP(ADS1263_MODE2_GAIN, adc->channel_config[scan_chan->channel].pga_gain) |
+		FIELD_PREP(ADS1263_MODE2_DR, ADS1263_100SPS);
+
+	const u8 txbuf[] = { ADS1263_CMD_WREG | ADS1263_REG_MODE2, 1, MODE2, FIELD_PREP(ADS1263_INPMUX_MUXP, scan_chan->channel) |
+		FIELD_PREP(ADS1263_INPMUX_MUXN, scan_chan->channel2) };
+
+	ret = spi_write(adc->spi, txbuf, ARRAY_SIZE(txbuf));
+	if (ret)
+		dev_err(&adc->spi->dev, "Write register failed\n");
+
+	for_each_set_bit(scan_index, indio_dev->active_scan_mask, indio_dev->masklength) {
+		
+		const struct iio_chan_spec *scan_chan = &indio_dev->channels[scan_index];
+
+		const u8 MODE2 = FIELD_PREP(ADS1263_MODE2_GAIN, adc->channel_config[scan_chan->channel].pga_gain) |
+			FIELD_PREP(ADS1263_MODE2_DR, ADS1263_100SPS);
+
+		const u8 txbuf[] = { ADS1263_CMD_WREG | ADS1263_REG_MODE2, 1, MODE2, FIELD_PREP(ADS1263_INPMUX_MUXP, scan_chan->channel) |
+			FIELD_PREP(ADS1263_INPMUX_MUXN, scan_chan->channel2) };
+		
+		struct spi_transfer transfer[] = {
+			{
+				.tx_buf = txbuf,
+				.len = ARRAY_SIZE(txbuf),
+			},
+			{
+				.rx_buf = &adc->rx_buf,
+				.len = ARRAY_SIZE(adc->rx_buf),
+			},
+		};
+
+		u32 read;
+
+		reinit_completion(&adc->completion);
+
+		ret = wait_for_completion_timeout(&adc->completion, msecs_to_jiffies(ADS1263_MAX_SETTLING_TIME_MS));
+		if (!ret)
+			return -ETIMEDOUT;
+
+		ret = spi_sync_transfer(adc->spi, transfer, ARRAY_SIZE(transfer));
+		if (ret)
+			dev_err(&adc->spi->dev, "Read data failed\n");
+
+		read = get_unaligned_be32(&adc->rx_buf[1]);
+		
+		printk("chan %i: %li, %i",
+			scan_index,
+			ads1263_check_sum(read, adc->rx_buf[5]) == 0 ? read : 0,
+			adc->rx_buf[0]
+		);
+	}
+
+	// if (!iio_trigger_using_own(indio_dev))
+	// 	ads1263_write_cmd(adc, ADS1263_CMD_STOP1);
 
     iio_push_to_buffers(indio_dev, i);
 
-// out:
-	// iio_trigger_notify_done(indio_dev->trig);
+out:
+	iio_trigger_notify_done(indio_dev->trig);
 
 	return IRQ_HANDLED;
 }
 
-static irqreturn_t ads1263_drdy_handler(int irq, void *private)
+static irqreturn_t ads1263_interrupt(int irq, void *private)
 {
 	struct iio_dev *indio_dev = private;
-	struct ads1263 *adc = iio_priv(indio_dev);8617688967268
+	struct ads1263 *adc = iio_priv(indio_dev);
 
+	if (iio_buffer_enabled(indio_dev) && iio_trigger_using_own(indio_dev))
+		iio_trigger_poll(adc->trig);
+	
 	complete(&adc->completion);
 
 	return IRQ_HANDLED;
 }
+
+static const struct iio_chan_spec ads1263_channels[] = {
+	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN0, ADS1263_AINCOM, 0),
+	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN1, ADS1263_AINCOM, 1),
+	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN2, ADS1263_AINCOM, 2),
+	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN3, ADS1263_AINCOM, 3),
+	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN4, ADS1263_AIN5,   4)
+};
 
 static int ads1263_probe(struct spi_device *spi)
 {
@@ -542,7 +622,7 @@ static int ads1263_probe(struct spi_device *spi)
 	indio_dev->num_channels = ARRAY_SIZE(ads1263_channels);
 
     if (spi->irq) {
-		ret = devm_request_irq(&spi->dev, spi->irq, ads1263_drdy_handler,
+		ret = devm_request_irq(&spi->dev, spi->irq, ads1263_interrupt,
                 IRQF_TRIGGER_FALLING, indio_dev->name, indio_dev);
 		if (ret)
 			return dev_err_probe(&spi->dev, ret,
@@ -551,6 +631,24 @@ static int ads1263_probe(struct spi_device *spi)
 		dev_err(&spi->dev, "data ready IRQ missing\n");
 		return -ENODEV;
 	}
+
+	adc->trig = devm_iio_trigger_alloc(&spi->dev, "%s-dev%d",
+		indio_dev->name, iio_device_id(indio_dev));
+	if (!adc->trig) {
+		dev_err(&spi->dev, "failed to allocate IIO trigger\n");
+		return -ENOMEM;
+	}
+
+	adc->trig->ops = &ads1263_trigger_ops;
+	adc->trig->dev.parent = &spi->dev;
+	iio_trigger_set_drvdata(adc->trig, indio_dev);
+	ret = devm_iio_trigger_register(&spi->dev, adc->trig);
+	if (ret) {
+		dev_err(&spi->dev, "failed to register IIO trigger\n");
+		return -ENOMEM;
+	}
+
+	indio_dev->trig = iio_trigger_get(adc->trig);
 
     ret = devm_iio_triggered_buffer_setup(&spi->dev, indio_dev,
 		NULL, &ads1263_trigger_handler, NULL);
@@ -570,12 +668,12 @@ static int ads1263_probe(struct spi_device *spi)
         dev_err(&spi->dev, "setup failed\r\n");
         return ret;
     }
-412725199010277436
+
 	return devm_iio_device_register(&spi->dev, indio_dev);
 }
 
 static const struct of_device_id ads1263_of_match[] = {
-	{412725199010277436
+	{
 		.compatible	= "ti,ads1262",
 		.compatible	= "ti,ads1263",
 	},
