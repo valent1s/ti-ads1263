@@ -5,6 +5,7 @@
 #include <linux/interrupt.h>
 
 #include <linux/iio/iio.h>
+#include <linux/iio/sysfs.h>
 #include <linux/iio/buffer.h>
 #include <linux/iio/trigger.h>
 #include <linux/iio/trigger_consumer.h>
@@ -295,7 +296,9 @@ enum ads1263_adc2_gain {
 #define ADS1263_MAX_SETTLING_TIME_MS	1000
 
 struct ads1263_channel_config {
-	unsigned int pga_gain;
+	u8 filter;
+	u8 pga_gain;
+	u8 data_rate;
 };
 
 struct ads1263 {
@@ -309,48 +312,78 @@ struct ads1263 {
 	
 	u8 rx_buf[1 + 4 + 1];
 	u32 data[10];
-
-	unsigned data_rate;
 };
 
-static const float ads1263_data_rates[] = {
-	[ADS1263_2d5SPS] = 2.5,
-	[ADS1263_5SPS] = 5,
-	[ADS1263_10SPS] = 10,
-	[ADS1263_16d6SPS] = 16.6,
-	[ADS1263_20SPS] = 20,
-	[ADS1263_50SPS] = 50,
-	[ADS1263_60SPS] = 60,
-	[ADS1263_100SPS] = 100,
-	[ADS1263_400SPS] = 400,
-	[ADS1263_1200SPS] = 1200,
-	[ADS1263_2400SPS] = 2400,
-	[ADS1263_4800SPS] = 4800,
-	[ADS1263_7200SPS] = 7200,
-	[ADS1263_14400SPS] = 14400,
-	[ADS1263_19200SPS] = 19200,
-	[ADS1263_38400SPS] = 38400,
+#define ADS1263_VOLTAGE_CHANNEL(chan1, chan2, si)                                              \
+	{                                                                                          \
+		.type = IIO_VOLTAGE,                                                                   \
+		.indexed = 1,                                                                          \
+		.channel = (chan1),                                                                    \
+		.channel2 = (chan2),                                                                   \
+		.differential = (chan2) < ADS1263_AINCOM,                                              \
+		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED) |                                   \
+							  BIT(IIO_CHAN_INFO_HARDWAREGAIN) |                                \
+							  BIT(IIO_CHAN_INFO_SAMP_FREQ) |                                   \
+							  BIT(IIO_CHAN_INFO_LOW_PASS_FILTER_3DB_FREQUENCY),                \
+		.info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_HARDWAREGAIN) |                 \
+											 BIT(IIO_CHAN_INFO_SAMP_FREQ) |                    \
+											 BIT(IIO_CHAN_INFO_LOW_PASS_FILTER_3DB_FREQUENCY), \
+		.scan_index = (si),                                                                    \
+		.scan_type = {                                                                         \
+			.sign = 's',                                                                       \
+			.realbits = ADS1263_RESOLUTION,                                                    \
+			.storagebits = ADS1263_RESOLUTION,                                                 \
+			.shift = 0,                                                                        \
+			.endianness = IIO_CPU,                                                             \
+		},                                                                                     \
+	}
+
+static const int ads1263_fil[] = {
+	[ADS1263_SINC1] = 1,  
+	[ADS1263_SINC2] = 2,
+	[ADS1263_SINC3] = 3,
+	[ADS1263_SINC4] = 4,
+	[ADS1263_FIR] = 5
 };
 
-#define ADC1263_VOLTAGE_CHANNEL(chan1, chan2, si)					\
-		{															\
-			.type = IIO_VOLTAGE,									\
-			.indexed = 1,											\
-			.channel = (chan1),										\
-			.channel2 = (chan2),									\
-			.differential = (chan2) < ADS1263_AINCOM,				\
-			.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |			\
-								  BIT(IIO_CHAN_INFO_HARDWAREGAIN) |	\
-								  BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
-			.scan_index = (si),										\
-			.scan_type = {											\
-				.sign = 's',										\
-				.realbits = ADS1263_RESOLUTION,						\
-				.storagebits = ADS1263_RESOLUTION,					\
-				.shift = 0,											\
-                .endianness = IIO_BE,                       		\
-			},														\
-		}
+static const int ads1263_hardwaregain[] = {
+	[ADS1263_GAIN_1] = 1,
+	[ADS1263_GAIN_2] = 2,
+	[ADS1263_GAIN_4] = 4,
+	[ADS1263_GAIN_8] = 8,
+	[ADS1263_GAIN_16] = 16,
+	[ADS1263_GAIN_32] = 32,
+	[ADS1263_GAIN_64] = 64,
+	[ADS1263_GAIN_128] = 128
+};
+
+static const int ads1263_data_rates[][2] = {
+	[ADS1263_2d5SPS] = {2, 500000},
+	[ADS1263_5SPS] = {5, 0},
+	[ADS1263_10SPS] = {10, 0},
+	[ADS1263_16d6SPS] = {16, 600000},
+	[ADS1263_20SPS] = {20, 0},
+	[ADS1263_50SPS] = {50, 0},
+	[ADS1263_60SPS] = {60, 0},
+	[ADS1263_100SPS] = {100, 0},
+	[ADS1263_400SPS] = {400, 0},
+	[ADS1263_1200SPS] = {1200, 0},
+	[ADS1263_2400SPS] = {2400, 0},
+	[ADS1263_4800SPS] = {4800, 0},
+	[ADS1263_7200SPS] = {7200, 0},
+	[ADS1263_14400SPS] = {14400, 0},
+	[ADS1263_19200SPS] = {19200, 0},
+	[ADS1263_38400SPS] = {38400, 0}
+};
+
+static const struct iio_chan_spec ads1263_channels[] = {
+	ADS1263_VOLTAGE_CHANNEL(ADS1263_AIN0, ADS1263_AIN1, 0),
+	ADS1263_VOLTAGE_CHANNEL(ADS1263_AIN2, ADS1263_AIN3, 1),
+	ADS1263_VOLTAGE_CHANNEL(ADS1263_AIN4, ADS1263_AINCOM, 2),
+	ADS1263_VOLTAGE_CHANNEL(ADS1263_AIN5, ADS1263_AINCOM, 3),
+	ADS1263_VOLTAGE_CHANNEL(ADS1263_AIN6, ADS1263_AINCOM, 4),
+	ADS1263_VOLTAGE_CHANNEL(ADS1263_AIN7, ADS1263_AINCOM, 5)
+};
 
 static void ads1263_reset(const struct ads1263 *adc)
 {
@@ -447,16 +480,25 @@ static int ads1263_setup(struct iio_dev *indio_dev)
     return 0;
 }
 
-static int ads1263_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *chan, int *val, int *val2, long mask) {
+static int ads1263_read_raw(struct iio_dev *indio_dev,
+							struct iio_chan_spec const *chan,
+							int *val,
+							int *val2,
+							long mask)
+{
 	struct ads1263 *adc = iio_priv(indio_dev);
 	int ret;
 
-    const u8 MODE2 = ADS1263_MODE2_GAIN(adc->channel_config[chan->channel].pga_gain) | ADS1263_MODE2_DR(ADS1263_100SPS);
+	const u8 MODE2 = ADS1263_MODE2_GAIN(adc->channel_config[chan->channel].pga_gain) |
+					 ADS1263_MODE2_DR(adc->channel_config[chan->channel].data_rate);
 	const u8 INPMUX = ADS1263_INPMUX_MUXP(chan->channel) | ADS1263_INPMUX_MUXN(chan->channel2);
-	const u8 txbuf[] = { ADS1263_CMD_WREG(ADS1263_REG_MODE2), 1, MODE2, INPMUX };
+	const u8 txbuf[] = {ADS1263_CMD_WREG(ADS1263_REG_MODE2), 1, MODE2, INPMUX};
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
+		if (iio_buffer_enabled(indio_dev))
+				return -EBUSY;
+
         ret = iio_device_claim_direct_mode(indio_dev);
 		if (ret)
 			return ret;
@@ -481,47 +523,111 @@ static int ads1263_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec cons
 		
 		return IIO_VAL_INT;
     case IIO_CHAN_INFO_HARDWAREGAIN:
-        *val = adc->channel_config[chan->channel].pga_gain;
+        *val = ads1263_hardwaregain[adc->channel_config[chan->channel].pga_gain];
         return IIO_VAL_INT;
 
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		*val = adc->data_rate;
-		return IIO_VAL_INT;
+		*val = ads1263_data_rates[adc->channel_config[chan->channel].data_rate][0];
+		*val2 = ads1263_data_rates[adc->channel_config[chan->channel].data_rate][1];
+		return IIO_VAL_INT_PLUS_MICRO;
+
+	case IIO_CHAN_INFO_LOW_PASS_FILTER_3DB_FREQUENCY:
+		*val = ads1263_fil[adc->channel_config[chan->channel].filter];
+		return IIO_VAL_CHAR;
 	}
 
 	return -EINVAL;
 }
 
-static int ads1263_write_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *chan, int val, int val2, long mask) {
+static int ads1263_write_raw(struct iio_dev *indio_dev,
+							 struct iio_chan_spec const *chan,
+							 int val,
+							 int val2,
+							 long mask)
+{
 	struct ads1263 *adc = iio_priv(indio_dev);
 
 	switch (mask) {
 	case IIO_CHAN_INFO_HARDWAREGAIN:
-		adc->channel_config[chan->channel].pga_gain = val;
-		return 0;
+		for (int i = 0; i < ARRAY_SIZE(ads1263_hardwaregain); i++) {
+			if (val == ads1263_hardwaregain[i]) {
+				adc->channel_config[chan->channel].pga_gain = i;
+				return 0;
+			}
+		}
+		return -EINVAL;
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		adc->data_rate = val;
-		return IIO_VAL_INT;
+		for (int i = 0; i < ARRAY_SIZE(ads1263_data_rates); i++) {
+			if (val == ads1263_data_rates[i][0] &&
+				val2 == ads1263_data_rates[i][1]) {
+				adc->channel_config[chan->channel].data_rate = i;
+				return 0;
+			}
+		}
+		return -EINVAL;
+	case IIO_CHAN_INFO_LOW_PASS_FILTER_3DB_FREQUENCY:
+		for (int i = 0; i < ARRAY_SIZE(ads1263_fil); i++) {
+			if (val == ads1263_fil[i]) {
+				adc->channel_config[chan->channel].filter = val;
+				return 0;
+			}
+		}
+		return -EINVAL;
 	}
 
 	return -EINVAL;
 }
 
-// static IIO_CONST_ATTR(hardwaregain_available,
-// 	"0 1 2 3 4 5 6 7");
+static int ads1263_read_avail(struct iio_dev *indio_dev,
+							  struct iio_chan_spec const *chan,
+							  const int **vals,
+							  int *type,
+							  int *length,
+							  long mask)
+{
+	struct ads1263 *adc = iio_priv(indio_dev);
 
-// static struct attribute *ads1263_attributes[] = {
-// 	&iio_const_attr_hardwaregain_available.dev_attr.attr,
-// 	NULL,
-// };
+	switch (mask) {
+	case IIO_CHAN_INFO_HARDWAREGAIN:
+		*vals = ads1263_hardwaregain;
+		*type = IIO_VAL_INT;
+		*length = ARRAY_SIZE(ads1263_hardwaregain);
+		return IIO_AVAIL_LIST;
+	case IIO_CHAN_INFO_SAMP_FREQ:
+		*vals = (int *)ads1263_data_rates;
+		*type = IIO_VAL_INT_PLUS_MICRO;
+		*length = ARRAY_SIZE(ads1263_data_rates) * 2;
+		return IIO_AVAIL_LIST;
+	case IIO_CHAN_INFO_LOW_PASS_FILTER_3DB_FREQUENCY:
+		*vals = ads1263_fil;
+		*type = IIO_VAL_INT;
+		*length = ARRAY_SIZE(ads1263_fil);
+		return IIO_AVAIL_LIST;
+	}
 
-// static const struct attribute_group ads1263_attrs_group = {
-// 	.attrs = ads1263_attributes,
-// };
+	return -EINVAL;
+}
+
+static int ads1263_buffer_preenable(struct iio_dev *indio_dev)
+{
+	const int scan_index = find_first_bit(indio_dev->active_scan_mask, indio_dev->masklength);
+	const struct iio_chan_spec *scan_chan = &indio_dev->channels[scan_index];
+	const struct ads1263 *adc = iio_priv(indio_dev);
+	const u8 MODE2 = ADS1263_MODE2_DR(adc->channel_config[scan_chan->channel].data_rate) |
+					 ((scan_chan->channel2 != ADS1263_AINCOM) ? ADS1263_MODE2_GAIN(adc->channel_config[scan_chan->channel].pga_gain) : ADS1263_MODE2_BYPASS(1));
+	const u8 txbuf[] = {ADS1263_CMD_WREG(ADS1263_REG_MODE2), 1, MODE2, ADS1263_INPMUX_MUXP(scan_chan->channel) | ADS1263_INPMUX_MUXN(scan_chan->channel2)};
+
+	return spi_write(adc->spi, txbuf, ARRAY_SIZE(txbuf));
+}
+
+static const struct iio_buffer_setup_ops ads1263_buffer_setup_ops = {
+	.preenable	= ads1263_buffer_preenable,
+};
 
 static const struct iio_info ads1263_info = {
 	.read_raw = ads1263_read_raw,
     .write_raw = ads1263_write_raw,
+	.read_avail = ads1263_read_avail,
 };
 
 static int ads1263_set_trigger_state(struct iio_trigger *trig, bool state)
@@ -542,39 +648,25 @@ static irqreturn_t ads1263_trigger_handler(int irq, void *private)
 	struct ads1263 *adc = iio_priv(indio_dev);
 	int ret;
 	int scan_index = find_first_bit(indio_dev->active_scan_mask, indio_dev->masklength);
-	int next_scan_index;
 	int i = 0;
 	u32 read;
-
-	const struct iio_chan_spec *scan_chan = &indio_dev->channels[scan_index];
-
-	const u8 MODE2 = ADS1263_MODE2_GAIN(adc->channel_config[scan_chan->channel].pga_gain) |
-		ADS1263_MODE2_DR(ADS1263_100SPS);
-
-	const u8 txbuf[] = { ADS1263_CMD_WREG(ADS1263_REG_MODE2), 1, MODE2, ADS1263_INPMUX_MUXP(scan_chan->channel) |
-		ADS1263_INPMUX_MUXN(scan_chan->channel2) };
-
+	
 	if (!iio_trigger_using_own(indio_dev))
 		ads1263_write_cmd(adc, ADS1263_CMD_START1);
 
-	ret = spi_write(adc->spi, txbuf, ARRAY_SIZE(txbuf));
-	if (ret)
-		dev_err(&adc->spi->dev, "Write register failed\n");
-
 	for_each_set_bit(scan_index, indio_dev->active_scan_mask, indio_dev->masklength) {
 
-		next_scan_index = find_next_bit(indio_dev->active_scan_mask, indio_dev->masklength, scan_index + 1);
+		int next_scan_index = find_next_bit(indio_dev->active_scan_mask, indio_dev->masklength, scan_index + 1);
 		if (next_scan_index >= indio_dev->masklength)
 			next_scan_index = find_first_bit(indio_dev->active_scan_mask, indio_dev->masklength);
-		
+
 		const struct iio_chan_spec *next_scan_chan = &indio_dev->channels[next_scan_index];
 
-		const u8 NEXT_MODE2 = ADS1263_MODE2_GAIN(adc->channel_config[next_scan_chan->channel].pga_gain) |
-			ADS1263_MODE2_DR(ADS1263_100SPS);
+		const u8 NEXT_MODE2 = ADS1263_MODE2_DR(adc->channel_config[next_scan_chan->channel].data_rate) |
+							  ((next_scan_chan->channel2 != ADS1263_AINCOM) ? ADS1263_MODE2_GAIN(adc->channel_config[next_scan_chan->channel].pga_gain) : ADS1263_MODE2_BYPASS(1));
 
-		const u8 next_txbuf[] = { ADS1263_CMD_WREG(ADS1263_REG_MODE2), 1, NEXT_MODE2, ADS1263_INPMUX_MUXP(next_scan_chan->channel) |
-			ADS1263_INPMUX_MUXN(next_scan_chan->channel2) };
-		
+		const u8 next_txbuf[] = {ADS1263_CMD_WREG(ADS1263_REG_MODE2), 1, NEXT_MODE2, ADS1263_INPMUX_MUXP(next_scan_chan->channel) | ADS1263_INPMUX_MUXN(next_scan_chan->channel2)};
+
 		struct spi_transfer transfer[] = {
 			{
 				.rx_buf = adc->rx_buf,
@@ -586,15 +678,15 @@ static irqreturn_t ads1263_trigger_handler(int irq, void *private)
 			},
 		};
 
-		reinit_completion(&adc->completion);
-
 		ret = wait_for_completion_timeout(&adc->completion, msecs_to_jiffies(ADS1263_MAX_SETTLING_TIME_MS));
 		if (!ret)
-			return -ETIMEDOUT;
+			goto out;
 
 		ret = spi_sync_transfer(adc->spi, transfer, ARRAY_SIZE(transfer));
 		if (ret)
-			dev_err(&adc->spi->dev, "Read data failed\n");
+			goto out;
+
+		reinit_completion(&adc->completion);
 
 		read = get_unaligned_be32(&adc->rx_buf[1]);
 		adc->data[i] = ads1263_check_sum(read, adc->rx_buf[5]) == 0 ? read : 0;
@@ -607,6 +699,7 @@ static irqreturn_t ads1263_trigger_handler(int irq, void *private)
 
     iio_push_to_buffers(indio_dev, adc->data);
 
+out:
 	iio_trigger_notify_done(indio_dev->trig);
 
 	return IRQ_HANDLED;
@@ -624,14 +717,6 @@ static irqreturn_t ads1263_interrupt(int irq, void *private)
 
 	return IRQ_HANDLED;
 }
-
-static const struct iio_chan_spec ads1263_channels[] = {
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN0, ADS1263_AINCOM, 0),
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN1, ADS1263_AINCOM, 1),
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN2, ADS1263_AINCOM, 2),
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN3, ADS1263_AINCOM, 3),
-	ADC1263_VOLTAGE_CHANNEL(ADS1263_AIN4, ADS1263_AIN5,   4)
-};
 
 static int ads1263_probe(struct spi_device *spi)
 {
@@ -684,8 +769,9 @@ static int ads1263_probe(struct spi_device *spi)
 		return -ENOMEM;
 	}
 
-    ret = devm_iio_triggered_buffer_setup(&spi->dev, indio_dev,
-		NULL, &ads1263_trigger_handler, NULL);
+	ret = devm_iio_triggered_buffer_setup(&spi->dev, indio_dev, NULL,
+										  &ads1263_trigger_handler,
+										  &ads1263_buffer_setup_ops);
 	if (ret) {
 		dev_err(&spi->dev, "failed to setup IIO buffer\n");
 		return ret;
