@@ -1,14 +1,14 @@
 obj-m += ti-ads1263.o
 
-all: module
-	echo Builded kernel module
+SRC := $(shell pwd)
 
-module:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
-dt: ads1263-overlay.dts
-	dtc -@ -I dts -O dtb -o ads1263-overlay.dtbo ads1263-overlay.dts
+all:
+	$(MAKE) -C $(KERNEL_SRC) M=$(SRC)
+
+modules_install:
+	$(MAKE) -C $(KERNEL_SRC) M=$(SRC) modules_install
+
 clean:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
-	rm -rf ads1263-overlay.dtbo
-install:
-	cp ti-ads1263.ko /lib/modules/$(shell uname -r)/kernel/drivers/iio/adc/
+	rm -f *.o *~ core .depend .*.cmd *.ko *.mod.c
+	rm -f Module.markers Module.symvers modules.order
+	rm -rf .tmp_versions Modules.symvers
