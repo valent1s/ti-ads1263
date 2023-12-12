@@ -11,8 +11,10 @@
 #include <linux/iio/trigger_consumer.h>
 #include <linux/iio/triggered_buffer.h>
 
+#include <linux/regmap.h>
 #include <linux/module.h>
 #include <linux/spi/spi.h>
+
 
 /* Commands */
 #define ADS1263_CMD_NOP			0x00 /* Sends a no operation command to the device */
@@ -301,6 +303,46 @@ struct ads1263_channel_config {
 	u8 data_rate;
 };
 
+static int ads1263_read(void *context, const void *reg_buf, size_t reg_size,
+						void *val_buf, size_t val_size)
+{
+	struct device *dev = context;
+	struct spi_device *spi = to_spi_device(dev);
+	const size_t new_reg_size = reg_size + 2;
+
+	u8 *new_reg_buf[new_reg_size];
+
+	new_reg_buf[0] = ADS1263_CMD_RREG(((u8 *)reg_buf)[0]);
+	new_reg_buf[1] = new_reg_size - 1;
+
+	memcpy(new_reg_buf + 2, (u8 *)reg_buf + 1, new_reg_size);
+
+	return spi_write_then_read(spi, new_reg_buf, new_reg_size, val_buf, val_size);
+}
+
+static int ads1263_write(void *context, const void *data, size_t count)
+{
+	struct device *dev = context;
+	struct spi_device *spi = to_spi_device(dev);
+	const size_t new_data_count = count + 2;
+
+	u8 *new_data[new_data_count];
+
+	new_data[0] = ADS1263_CMD_WREG(((u8 *)data)[0]);
+	new_data[1] = count - 1;
+
+	memcpy(new_data + 2, (u8 *)data + 1, count);
+
+	return spi_write(spi, new_data, new_data_count);
+}
+
+static const struct regmap_config ads1263_regmap_config = {
+	.reg_bits = 8,
+	.val_bits = 8,
+	.read = ads1263_read,
+	.write = ads1263_write
+};
+
 struct ads1263 {
 	struct spi_device *spi;
 
@@ -308,8 +350,8 @@ struct ads1263 {
 
 	struct completion completion;
 
-	struct gpio_desc *reset_pin;
-	
+	struct regmap *regmap;
+
 	u8 rx_buf[1 + 4 + 1];
 	u32 data[10];
 };
@@ -385,46 +427,9 @@ static const struct iio_chan_spec ads1263_channels[] = {
 	ADS1263_VOLTAGE_CHANNEL(ADS1263_AIN7, ADS1263_AINCOM, 5)
 };
 
-static void ads1263_reset(const struct ads1263 *adc)
-{
-	gpiod_set_value(adc->reset_pin, 0);
-	udelay(ADS1263_WAIT_RESET_CYCLES / ADS1263_MAX_CLK_MHZ);
-	gpiod_set_value(adc->reset_pin, 1);
-}
-
 static int ads1263_write_cmd(const struct ads1263 *adc, u8 cmd)
 {
-	int ret = spi_write(adc->spi, &cmd, 1);
-
-	if (ret)
-		dev_err(&adc->spi->dev, "Write cmd(%02x) failed\n", cmd);
-
-    return ret;
-}
-
-static int ads1263_read_reg(const struct ads1263 *adc, u8 reg)
-{
-    const u8 txbuf[] = { ADS1263_CMD_RREG(reg), 0 };
-	u8 result;
-    int ret = spi_write_then_read(adc->spi, txbuf, ARRAY_SIZE(txbuf), &result, 1);
-
-	if (ret) {
-		dev_err(&adc->spi->dev, "Read register failed\n");
-    	return ret;
-	}
-
-	return result;
-}
-
-static int ads1263_write_reg(const struct ads1263 *adc, u8 reg, u8 data)
-{
-    const u8 txbuf[] = { ADS1263_CMD_WREG(reg), 0, data };
-	int ret = spi_write(adc->spi, txbuf, ARRAY_SIZE(txbuf));
-
-	if (ret)
-		dev_err(&adc->spi->dev, "Write register failed\n");
-
-    return ret;
+    return spi_write(adc->spi, &cmd, 1);
 }
 
 static size_t ads1263_check_sum(u32 val, u8 byt)
@@ -451,33 +456,51 @@ static int ads1263_read_adc1_data(const struct ads1263 *adc)
     return ads1263_check_sum(read, buf[5]) == 0 ? read : 0;
 }
 
-static int ads1263_setup(struct iio_dev *indio_dev)
+static int ads1263_reset(struct ads1263 *adc,
+						 struct gpio_desc *gpio_reset)
 {
-    struct ads1263 *adc = iio_priv(indio_dev);
     int ret;
-    
-    const u8 REFMUX = ADS1263_REFMUX_RMUXN(ADS1263_INTERNAL_VAVDD) | ADS1263_REFMUX_RMUXP(ADS1263_INTERNAL_VAVDD);
-    const u8 MODE1 = ADS1263_MODE1_FILTER(ADS1263_SINC4);
 
-    ads1263_reset(adc);
+	if (gpio_reset) {
+		/*
+		 * Reset the ADC by taking the RESET/PWDN pin low for a minimum 4 fCLK cycles,
+		 * and then returning the pin high.
+		 * Holding the RESET/PWDN pin low for longer than 65536 fCLK cycles (9 ms)
+		 * engages power-down mode. After the RESET/PWDN pin is taken high, the delay
+		 * time is required before sending the first serial interface command.
+		 */
+		gpiod_set_value_cansleep(gpio_reset, 0);
+		usleep_range(1, 750);
+		gpiod_set_value_cansleep(gpio_reset, 1);
+		usleep_range(2, 750);
+	} else {
+		/*
+		 * Perform a soft-reset if not.
+		 * Also write default values to the config registers that are not
+		 * affected by soft reset.
+		 */
+		ret = regmap_write(adc->regmap, ADS1263_CMD_RESET, 0);
+		if (ret < 0)
+			return ret;
 
-    ret = ads1263_write_reg(adc, ADS1263_REG_REFMUX, REFMUX);
-    if (ads1263_read_reg(adc, ADS1263_REG_REFMUX) != REFMUX) {
-        dev_err(&adc->spi->dev, "REG_REFMUX unsuccess\r\n");
-        return ret;
-    }
+		usleep_range(2, 750);
+	}
 
-    ret = ads1263_write_reg(adc, ADS1263_REG_MODE1, MODE1);
-    if (ads1263_read_reg(adc, ADS1263_REG_MODE1) != MODE1) {
-        dev_err(&adc->spi->dev, "REG_MODE1 unsuccess\r\n");
-        return ret;
-    }
+	ret = regmap_write(adc->regmap, ADS1263_REG_REFMUX,
+					   ADS1263_REFMUX_RMUXN(ADS1263_INTERNAL_VAVDD) | ADS1263_REFMUX_RMUXP(ADS1263_INTERNAL_VAVDD));
+	if (ret < 0)
+		return ret;
 
-    adc->channel_config = devm_kcalloc(&adc->spi->dev, indio_dev->num_channels, sizeof(struct ads1263_channel_config), GFP_KERNEL);
-	if (!adc->channel_config)
-        return -ENOMEM;
+	ret = regmap_write(adc->regmap, ADS1263_REG_MODE1,
+					   ADS1263_MODE1_FILTER(ADS1263_SINC4));
+	if (ret < 0)
+		return ret;
 
-    return 0;
+	/*
+	 * No (correct) response received.
+	 * Device is mostly likely not connected to the bus.
+	 */
+	return 0; // -ENXIO
 }
 
 static int ads1263_read_raw(struct iio_dev *indio_dev,
@@ -585,8 +608,6 @@ static int ads1263_read_avail(struct iio_dev *indio_dev,
 							  int *length,
 							  long mask)
 {
-	struct ads1263 *adc = iio_priv(indio_dev);
-
 	switch (mask) {
 	case IIO_CHAN_INFO_HARDWAREGAIN:
 		*vals = ads1263_hardwaregain;
@@ -608,26 +629,10 @@ static int ads1263_read_avail(struct iio_dev *indio_dev,
 	return -EINVAL;
 }
 
-static int ads1263_buffer_preenable(struct iio_dev *indio_dev)
-{
-	const int scan_index = find_first_bit(indio_dev->active_scan_mask, indio_dev->masklength);
-	const struct iio_chan_spec *scan_chan = &indio_dev->channels[scan_index];
-	const struct ads1263 *adc = iio_priv(indio_dev);
-	const u8 MODE2 = ADS1263_MODE2_DR(adc->channel_config[scan_chan->channel].data_rate) |
-					 ((scan_chan->channel2 != ADS1263_AINCOM) ? ADS1263_MODE2_GAIN(adc->channel_config[scan_chan->channel].pga_gain) : ADS1263_MODE2_BYPASS(1));
-	const u8 txbuf[] = {ADS1263_CMD_WREG(ADS1263_REG_MODE2), 1, MODE2, ADS1263_INPMUX_MUXP(scan_chan->channel) | ADS1263_INPMUX_MUXN(scan_chan->channel2)};
-
-	return spi_write(adc->spi, txbuf, ARRAY_SIZE(txbuf));
-}
-
-static const struct iio_buffer_setup_ops ads1263_buffer_setup_ops = {
-	.preenable	= ads1263_buffer_preenable,
-};
-
 static const struct iio_info ads1263_info = {
 	.read_raw = ads1263_read_raw,
     .write_raw = ads1263_write_raw,
-	.read_avail = ads1263_read_avail,
+	.read_avail = ads1263_read_avail
 };
 
 static int ads1263_set_trigger_state(struct iio_trigger *trig, bool state)
@@ -644,49 +649,54 @@ static const struct iio_trigger_ops ads1263_trigger_ops = {
 static irqreturn_t ads1263_trigger_handler(int irq, void *private)
 {
     const struct iio_poll_func *pf = private;
-	struct iio_dev *indio_dev = pf->indio_dev;
+	const struct iio_dev *indio_dev = pf->indio_dev;
 	struct ads1263 *adc = iio_priv(indio_dev);
 	int ret;
 	int scan_index = find_first_bit(indio_dev->active_scan_mask, indio_dev->masklength);
+	int next_scan_index;
 	int i = 0;
 	u32 read;
-	
+
+	const struct iio_chan_spec *scan_chan = &indio_dev->channels[scan_index];
+
+	const u8 MODE2 = ADS1263_MODE2_GAIN(adc->channel_config[scan_chan->channel].pga_gain) |
+					 ADS1263_MODE2_DR(adc->channel_config[scan_chan->channel].data_rate);
+
+	const u8 txbuf[] = {ADS1263_CMD_WREG(ADS1263_REG_MODE2), 1, MODE2, ADS1263_INPMUX_MUXP(scan_chan->channel) | ADS1263_INPMUX_MUXN(scan_chan->channel2)};
+
 	if (!iio_trigger_using_own(indio_dev))
 		ads1263_write_cmd(adc, ADS1263_CMD_START1);
 
+	spi_write(adc->spi, txbuf, ARRAY_SIZE(txbuf));
+
 	for_each_set_bit(scan_index, indio_dev->active_scan_mask, indio_dev->masklength) {
 
-		int next_scan_index = find_next_bit(indio_dev->active_scan_mask, indio_dev->masklength, scan_index + 1);
+		next_scan_index = find_next_bit(indio_dev->active_scan_mask, indio_dev->masklength, scan_index + 1);
 		if (next_scan_index >= indio_dev->masklength)
 			next_scan_index = find_first_bit(indio_dev->active_scan_mask, indio_dev->masklength);
 
 		const struct iio_chan_spec *next_scan_chan = &indio_dev->channels[next_scan_index];
 
-		const u8 NEXT_MODE2 = ADS1263_MODE2_DR(adc->channel_config[next_scan_chan->channel].data_rate) |
-							  ((next_scan_chan->channel2 != ADS1263_AINCOM) ? ADS1263_MODE2_GAIN(adc->channel_config[next_scan_chan->channel].pga_gain) : ADS1263_MODE2_BYPASS(1));
+		const u8 NEXT_MODE2 = ADS1263_MODE2_GAIN(adc->channel_config[scan_chan->channel].pga_gain) |
+							  ADS1263_MODE2_DR(adc->channel_config[scan_chan->channel].data_rate);
 
 		const u8 next_txbuf[] = {ADS1263_CMD_WREG(ADS1263_REG_MODE2), 1, NEXT_MODE2, ADS1263_INPMUX_MUXP(next_scan_chan->channel) | ADS1263_INPMUX_MUXN(next_scan_chan->channel2)};
 
 		struct spi_transfer transfer[] = {
 			{
 				.rx_buf = adc->rx_buf,
-				.len = ARRAY_SIZE(adc->rx_buf),
-			},
-			{
 				.tx_buf = next_txbuf,
-				.len = ARRAY_SIZE(next_txbuf),
-			},
+				.len = ARRAY_SIZE(adc->rx_buf),
+			}
 		};
+
+		reinit_completion(&adc->completion);
 
 		ret = wait_for_completion_timeout(&adc->completion, msecs_to_jiffies(ADS1263_MAX_SETTLING_TIME_MS));
 		if (!ret)
-			goto out;
+			return -ETIMEDOUT;
 
-		ret = spi_sync_transfer(adc->spi, transfer, ARRAY_SIZE(transfer));
-		if (ret)
-			goto out;
-
-		reinit_completion(&adc->completion);
+		spi_sync_transfer(adc->spi, transfer, ARRAY_SIZE(transfer));
 
 		read = get_unaligned_be32(&adc->rx_buf[1]);
 		adc->data[i] = ads1263_check_sum(read, adc->rx_buf[5]) == 0 ? read : 0;
@@ -699,7 +709,6 @@ static irqreturn_t ads1263_trigger_handler(int irq, void *private)
 
     iio_push_to_buffers(indio_dev, adc->data);
 
-out:
 	iio_trigger_notify_done(indio_dev->trig);
 
 	return IRQ_HANDLED;
@@ -721,19 +730,26 @@ static irqreturn_t ads1263_interrupt(int irq, void *private)
 static int ads1263_probe(struct spi_device *spi)
 {
 	struct ads1263 *adc;
+	struct gpio_desc *gpio_reset;
 	struct iio_dev *indio_dev;
+	struct regmap *regmap;
 	int ret;
+
+	regmap = devm_regmap_init_spi(spi, &ads1263_regmap_config);
+	if (IS_ERR(regmap))
+		return dev_err_probe(&spi->dev, PTR_ERR(regmap),
+				     "Failed to set up SPI regmap\n");
 
 	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*adc));
 	if (!indio_dev)
 		return -ENOMEM;
 
 	adc = iio_priv(indio_dev);
+
 	adc->spi = spi;
+	adc->regmap = regmap;
+
 	init_completion(&adc->completion);
-	adc->reset_pin = devm_gpiod_get(&spi->dev, "reset", GPIOD_OUT_HIGH);
-	if (IS_ERR(adc->reset_pin))
-		return PTR_ERR(adc->reset_pin);
 	
 	indio_dev->dev.parent = &spi->dev;
 	indio_dev->name = "ads1263";
@@ -764,30 +780,32 @@ static int ads1263_probe(struct spi_device *spi)
 	indio_dev->trig->dev.parent = &spi->dev;
 	iio_trigger_set_drvdata(indio_dev->trig, adc);
 	ret = devm_iio_trigger_register(&spi->dev, indio_dev->trig);
-	if (ret) {
-		dev_err(&spi->dev, "failed to register IIO trigger\n");
-		return -ENOMEM;
-	}
+	if (ret)
+		return dev_err_probe(&spi->dev, ret, "Failed to register IIO trigger\n");
 
-	ret = devm_iio_triggered_buffer_setup(&spi->dev, indio_dev, NULL,
-										  &ads1263_trigger_handler,
-										  &ads1263_buffer_setup_ops);
-	if (ret) {
-		dev_err(&spi->dev, "failed to setup IIO buffer\n");
-		return ret;
-	}
+    ret = devm_iio_triggered_buffer_setup(&spi->dev, indio_dev,
+		NULL, &ads1263_trigger_handler, NULL);
+	if (ret)
+		return dev_err_probe(&spi->dev, ret, "Failed to setup IIO buffer\n");
 
 	spi->cs_setup.value = ADS1263_WAIT_CSSC_NS;
 	spi->cs_setup.unit = SPI_DELAY_UNIT_NSECS;
 
 	spi->cs_hold.value = ADS1263_WAIT_SCCS_NS;
 	spi->cs_hold.unit = SPI_DELAY_UNIT_NSECS;
+	
+	gpio_reset = devm_gpiod_get_optional(&spi->dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(gpio_reset))
+		return dev_err_probe(&spi->dev, PTR_ERR(gpio_reset),
+				     "Failed to get GPIO reset pin\n");
     
-    ret = ads1263_setup(indio_dev);
-    if (ret) {
-        dev_err(&spi->dev, "setup failed\r\n");
-        return ret;
-    }
+    ret = ads1263_reset(adc, gpio_reset);
+    if (ret < 0)
+		return dev_err_probe(&spi->dev, ret, "Failed to reset device\n");
+
+	adc->channel_config = devm_kcalloc(&spi->dev, indio_dev->num_channels, sizeof(struct ads1263_channel_config), GFP_KERNEL);
+	if (!adc->channel_config)
+        return -ENOMEM;
 
 	return devm_iio_device_register(&spi->dev, indio_dev);
 }
